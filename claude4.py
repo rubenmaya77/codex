@@ -1,4 +1,4 @@
-%%writefile submission.py
+%%writefile main.py
 import math
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -17,10 +17,17 @@ CROP_SPECS = {
     "MELON":      {"seed_cost": 80,  "cycle_days": 11, "yield_unfert": 6, "yield_fert": 6, "ongoing": False},
 }
 
+# NOTA: "max_animals" es un tope ESTRATEGICO propio del agente, no una regla
+# del juego (el juego no limita cuantos animales puedes tener, solo el
+# espacio de tierra/coops/pastures). El "Max Yield" de la tabla oficial es
+# max_held: el tope de producto SIN COSECHAR por animal, no un limite de
+# cantidad. FIX: los valores de COW/SHEEP (antes 2) no correspondian a nada
+# en las reglas; se alinean aqui con max_held (4/6/6) como referencia
+# razonable, pero se puede subir mas si el terreno/economia lo justifica.
 ANIMAL_SPECS = {
     "GOOSE": {"cost": 300, "days_to_produce": 1, "product": "EGG",  "yield_per_prod": 1.0, "max_animals": 4},
-    "COW":   {"cost": 400, "days_to_produce": 2, "product": "MILK", "yield_per_prod": 1.0, "max_animals": 2},
-    "SHEEP": {"cost": 500, "days_to_produce": 3, "product": "WOOL", "yield_per_prod": 1.0, "max_animals": 2},
+    "COW":   {"cost": 400, "days_to_produce": 2, "product": "MILK", "yield_per_prod": 1.0, "max_animals": 6},
+    "SHEEP": {"cost": 500, "days_to_produce": 3, "product": "WOOL", "yield_per_prod": 1.0, "max_animals": 6},
 }
 
 # Parametros reales de la curva de precios del mercado (ver reglas de la competencia)
@@ -74,6 +81,15 @@ def _shape(func: str, x: float) -> float:
     if func == "log10":
         return math.log10(1 + x)
     return x
+
+
+def _fib_hire_cost(n: int, mult: float = 1.0) -> float:
+    """Costo de contratar la (n+1)-esima mano hoy. fib empieza 1,1,2,3,5,8,...
+    n = cantidad de contrataciones ya hechas hoy (hires_today)."""
+    a, b = 1, 1
+    for _ in range(max(n, 0)):
+        a, b = b, a + b
+    return mult * a
 
 
 def price_at(item: str, inv: float) -> int:
@@ -146,10 +162,13 @@ class StrategicPlanner:
         return demands
 
     def _count_owned_tiles(self) -> int:
+        # FIX: "owned" = cualquier casilla dentro de un cuadrante comprado,
+        # este vacia u ocupada. Antes excluia las vacias (tile is None),
+        # subestimando el tamano real de la granja.
         count = 0
         for row in self.tiles:
             for tile in row:
-                if tile is not None and tile != "LOCKED":
+                if tile != "LOCKED":
                     count += 1
         return count
 
@@ -264,6 +283,11 @@ class StrategicPlanner:
         if idx < 0 or idx >= len(LAND_PRICES):
             return False
         cost = LAND_PRICES[idx]
+        # Comprar el 2do cuadrante temprano si el flujo de caja lo permite:
+        # duplica la capacidad de produccion mucho antes de llenar el
+        # primer cuadrante, dejando mas dias para amortizarla.
+        if len(unlocked) == 1 and self.money >= cost + 200 and self.days_left > 10:
+            return True
         if self.money < cost + 500:
             return False
         if self.days_left < 6:
@@ -326,6 +350,7 @@ class StrategicPlanner:
             growth_ranked = [r for r in ranked if r[1] != liquidity_crop]
 
             if remaining_capacity > 0 and growth_ranked:
+                primary_n = 0  # FIX: evita UnboundLocalError si best_roi <= 0
                 best_roi, best_crop, best_fert = growth_ranked[0]
                 if best_roi > 0:
                     primary_n = math.ceil(remaining_capacity * 0.7)
@@ -367,8 +392,13 @@ class StrategicPlanner:
         if best_animal:
             strategy["animals"].append(best_animal)
 
-        if self.money > 500 and self.owned_tiles >= 15 and self.hires_today < 2 and self.days_left > 2:
-            strategy["should_hire_hands"] = 1
+        # Contratacion mas temprana que antes (el costo Fibonacci reinicia
+        # cada dia y las primeras contrataciones son casi gratis), pero sin
+        # sobrecontratar: seguimos exigiendo un minimo de tareas disponibles
+        # para que la mano no quede ociosa (el umbral bajo de 8, no 15,
+        # todavia filtra el arranque cuando casi no hay nada plantado).
+        if self.money > 300 and self.owned_tiles >= 8 and self.hires_today < 2 and self.days_left > 2:
+            strategy["should_hire_hands"] = 2 - self.hires_today
 
         strategy["should_expand_tiles"] = self._evaluate_tile_expansion()
 
@@ -391,6 +421,7 @@ class MarketManager:
         self.shed = self.private.get("shed", {})
         self.prices = self.market.get("prices", {})
         self.money = self.me["money"]
+        self.hires_today = self.me.get("hires_today", 0)
 
     def _count_animals(self) -> int:
         count = 0
@@ -415,6 +446,11 @@ class MarketManager:
             best_n = n
             if price > 1:
                 inv += 1
+        # Micro-lotes para productos premium sensibles a sobreoferta: no
+        # vender mas de 2/turno incluso si el corte de precio permitiria mas,
+        # para dejar que el consumo de la ciudad reponga precio entre turnos.
+        if self.day < 29 and item in ("MELON", "STRAWBERRY", "WOOL", "MILK"):
+            best_n = min(best_n, 2)
         return best_n
 
     def _simulate_sell_price(self, item: str, quantity: int) -> float:
@@ -439,9 +475,17 @@ class MarketManager:
             if item.endswith("_SEED"):
                 continue
             if item == "FERTILIZER":
-                # El fertilizante es un insumo que gestionamos via BUY_PRODUCT/FERTILIZE;
-                # nunca lo vendemos automaticamente para evitar comprar y vender en
-                # turnos alternos (perdiendo dinero en el spread de precios).
+                # FIX: antes nunca se vendia fertilizante, ni siquiera el
+                # excedente recolectado gratis de los animales (COLLECT_FERTILIZER).
+                # Mantenemos un buffer para las FERTILIZE planeadas y vendemos
+                # solo lo que sobra por encima de ese buffer (evita el ciclo
+                # comprar/vender del mismo turno que motivo el "continue" original).
+                fert_buffer = 5 if self.strategy.get("use_fertilizer_on") else 0
+                fert_excess = qty - fert_buffer
+                if fert_excess > 0:
+                    sell_qty = self._calculate_optimal_sell_quantity(item, fert_excess)
+                    if sell_qty > 0:
+                        orders.append(["SELL", item, sell_qty])
                 continue
             if item == "WHEAT" and self._needs_wheat_for_animals():
                 required = self._calculate_animal_feed_needs()
@@ -494,14 +538,90 @@ class MarketManager:
                 remaining_money -= cost
 
         # 6. CONTRATAR
+        # FIX: antes no se verificaba ni descontaba el costo (fib creciente)
+        # contra el dinero que ya se planeo gastar en los pasos anteriores
+        # de este mismo turno, arriesgando ordenes de HIRE que la partida
+        # rechaza o que dejan sin fondos las ordenes siguientes.
+        hires_planned = self.hires_today
         for _ in range(self.strategy.get("should_hire_hands", 0)):
+            cost = _fib_hire_cost(hires_planned)
+            if remaining_money < cost:
+                break
             orders.append(["HIRE"])
+            remaining_money -= cost
+            hires_planned += 1
 
         # 7. EXPANDIR
+        # FIX: la decision de expandir se tomo en StrategicPlanner con el
+        # dinero ORIGINAL del turno, sin saber cuanto se gastaria despues en
+        # semillas/fertilizante/animales/manos. Revalidamos aqui con lo que
+        # realmente queda.
         if self.strategy.get("should_expand_tiles", False):
-            orders.append(["BUY_LAND"])
+            unlocked = len(self.me.get("unlocked_quadrants", []))
+            idx = unlocked - 1
+            if 0 <= idx < len(LAND_PRICES):
+                land_cost = LAND_PRICES[idx]
+                if remaining_money >= land_cost:
+                    orders.append(["BUY_LAND"])
+                    remaining_money -= land_cost
 
         return orders[:10]
+
+
+def _hungarian_assignment(cost: List[List[float]]) -> List[int]:
+    """Algoritmo Hungaro (Kuhn-Munkres), O(n^2*m). Requiere n_filas <= n_columnas
+    (se rellena con columnas dummy de costo 0 en el llamador si hace falta).
+    Devuelve `assign` de largo n con assign[i] = columna asignada a la fila i,
+    minimizando el costo total. Reemplaza la asignacion secuencial/golosa
+    (primero el farmer toma lo mas cercano, luego cada mano por turno) por
+    la asignacion optima GLOBAL unidad<->tarea, evitando que una unidad
+    cruce media granja mientras otra estaba justo al lado de esa tarea."""
+    n = len(cost)
+    if n == 0:
+        return []
+    m = len(cost[0])
+    INF = float('inf')
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [INF] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = INF
+            j1 = -1
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(0, m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+    assign = [0] * (n + 1)
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            assign[p[j]] = j
+    return [assign[i] - 1 for i in range(1, n + 1)]
 
 
 # ==============================================================================
@@ -573,7 +693,21 @@ class OperationsManager:
                             scan["pasture"].append((x, y))
                         animal = tile.get("animal")
                         if animal in ("GOOSE", "COW", "SHEEP"):
-                            if not tile.get("fed_today", True):
+                            # FIX: los productos (huevo/leche/lana) tambien deben
+                            # cosecharse, o se quedan topeados en max_held sin
+                            # entrar nunca al cobertizo/venta.
+                            if tile.get("yield_units", 0) > 0:
+                                scan["harvest"].append((x, y))
+                            # FIX: antes solo se enrutaba hacia animales sin
+                            # alimentar. Ahora tambien se enruta si necesitan
+                            # CARE o si hay fertilizante disponible para
+                            # recolectar, o el bono de CARE y el fertilizante
+                            # gratis nunca se aprovechan salvo que una unidad
+                            # pase por ahi por casualidad.
+                            needs_feed = not tile.get("fed_today", True)
+                            needs_care = tile.get("fed_today", False) and not tile.get("cared_today", False)
+                            needs_fert_collect = tile.get("fertilizer_available", False)
+                            if needs_feed or needs_care or needs_fert_collect:
                                 scan["animals"].append((x, y))
         return scan
 
@@ -637,6 +771,26 @@ class OperationsManager:
                     return (animal, 1)
         return None
 
+    def _cargo_targets(self, inv: Dict, scan: Dict) -> List[Tuple[int, int]]:
+        """FIX: casillas donde se puede USAR lo que la unidad ya trae en el
+        inventario (animal por colocar, trigo para alimentar, fertilizante
+        para aplicar). Sin esto, una unidad que recoge algo en el cobertizo
+        y no se mueve en el mismo turno queda parada ahi mismo, y en el
+        siguiente turno la logica de 'estoy en el cobertizo con inventario'
+        la hace soltarlo de nuevo -> loop infinito de PICKUP/DROP sin nunca
+        entregarlo."""
+        targets: List[Tuple[int, int]] = []
+        if self._inv_count(inv, "GOOSE") > 0:
+            targets.extend(s for s in scan["coop"] if not self._current_tile(s).get("animal"))
+        for animal in ("COW", "SHEEP"):
+            if self._inv_count(inv, animal) > 0:
+                targets.extend(s for s in scan["pasture"] if not self._current_tile(s).get("animal"))
+        if self._inv_count(inv, "WHEAT") > 0:
+            targets.extend(scan["animals"])
+        if self._inv_count(inv, "FERTILIZER") > 0:
+            targets.extend(scan["fertilize"])
+        return targets
+
     def _immediate_action(self, pos: Tuple[int, int], inv: Dict, scan: Dict) -> Optional[List]:
         tile = self._current_tile(pos)
         if isinstance(tile, dict):
@@ -656,6 +810,10 @@ class OperationsManager:
             elif kind in ("COOP", "PASTURE"):
                 animal = tile.get("animal")
                 if animal:
+                    # FIX: cosechar producto acumulado ANTES de otras acciones,
+                    # para no dejarlo topeado en max_held sin vender nunca.
+                    if tile.get("yield_units", 0) > 0:
+                        return ["HARVEST"]
                     if not tile.get("fed_today", True) and self._inv_count(inv, "WHEAT") > 0:
                         return ["FEED"]
                     if tile.get("fertilizer_available"):
@@ -668,30 +826,40 @@ class OperationsManager:
                                       (kind == "PASTURE" and to_place in ("COW", "SHEEP"))):
                         return ["PLACE", to_place]
         elif tile is None:
-            crop = self._pick_crop_to_plant()
-            if crop:
-                self.remaining_to_plant[crop] = self.remaining_to_plant.get(crop, 0) - 1
-                return ["PLANT", crop]
-            # Construir una estructura nueva si tenemos un animal comprado (en el
-            # cobertizo o cargado) sin ninguna estructura libre donde colocarlo.
-            # Cada coop/pasture solo aloja UN animal, asi que puede hacer falta
-            # mas de una.
+            # FIX: si hay un animal comprado sin estructura libre donde
+            # colocarlo, construir tiene prioridad sobre plantar - un animal
+            # varado en el cobertizo es capital 100% ocioso (ya se pago su
+            # costo y no produce nada), mientras que una siembra retrasada
+            # un turno no pierde casi nada.
             unplaced_goose = self.shed.get("GOOSE", 0) + sum((inv or {}).get("GOOSE", 0) for inv in self.inventories)
             unplaced_pasture_animal = sum(
                 self.shed.get(a, 0) + sum((inv or {}).get(a, 0) for inv in self.inventories)
                 for a in ("COW", "SHEEP")
             )
-            if unplaced_goose > 0 and not self._has_unoccupied_structure(scan["coop"]):
+            needs_coop = unplaced_goose > 0 and not self._has_unoccupied_structure(scan["coop"])
+            needs_pasture = unplaced_pasture_animal > 0 and not self._has_unoccupied_structure(scan["pasture"])
+            if needs_coop:
                 return ["BUILD_COOP"]
-            if unplaced_pasture_animal > 0 and not self._has_unoccupied_structure(scan["pasture"]):
+            if needs_pasture:
                 return ["BUILD_PASTURE"]
+            crop = self._pick_crop_to_plant()
+            if crop:
+                self.remaining_to_plant[crop] = self.remaining_to_plant.get(crop, 0) - 1
+                return ["PLANT", crop]
 
         if pos in self.shed_positions:
+            cargo_targets = self._cargo_targets(inv, scan)
             if self._inv_total(inv) > 0:
-                return ["DROP"]
-            pick = self._pick_needed_shed_item(inv, scan)
-            if pick:
-                return ["PICKUP", pick[0], pick[1]]
+                if not cargo_targets:
+                    return ["DROP"]
+                # FIX: seguimos cargando algo con un destino pendiente (animal
+                # por colocar, trigo/fertilizante por usar en otra casilla).
+                # No lo soltamos aqui: caemos a `return None` y dejamos que
+                # _assign_movement nos lleve hacia ese destino.
+            else:
+                pick = self._pick_needed_shed_item(inv, scan)
+                if pick:
+                    return ["PICKUP", pick[0], pick[1]]
         return None
 
     def _step_towards(self, pos: Tuple[int, int], target: Tuple[int, int]) -> List:
@@ -718,45 +886,138 @@ class OperationsManager:
         avail.sort(key=lambda c: abs(c[0] - pos[0]) + abs(c[1] - pos[1]))
         return avail[0]
 
-    def _assign_movement(self, pos: Tuple[int, int], scan: Dict) -> Optional[List]:
+    # (la asignacion secuencial anterior fue reemplazada por
+    # _assign_tasks_optimally, que usa el Algoritmo Hungaro - ver arriba)
+
+    # Prioridad de cada categoria de tarea compartida (menor = mas urgente).
+    # Se usa junto con la distancia para construir el costo de la matriz
+    # unidad<->tarea del algoritmo Hungaro: BIG domina sobre la distancia
+    # maxima posible en el tablero (~18), asi que primero se respeta la
+    # prioridad y, dentro de la misma prioridad, se minimiza la distancia total.
+    TASK_PRIORITY = {"harvest": 0, "build": 1, "weed": 2, "animals": 3, "water": 4, "fertilize": 5, "plant": 6}
+    _BIG = 1000
+
+    def _needs_new_structure(self, scan: Dict) -> bool:
+        unplaced_goose = self.shed.get("GOOSE", 0) + sum((inv or {}).get("GOOSE", 0) for inv in self.inventories)
+        unplaced_pasture_animal = sum(
+            self.shed.get(a, 0) + sum((inv or {}).get(a, 0) for inv in self.inventories)
+            for a in ("COW", "SHEEP")
+        )
+        needs_coop = unplaced_goose > 0 and not self._has_unoccupied_structure(scan["coop"])
+        needs_pasture = unplaced_pasture_animal > 0 and not self._has_unoccupied_structure(scan["pasture"])
+        return needs_coop or needs_pasture
+
+    def _assign_tasks_optimally(self, units: List[Tuple[Tuple[int, int], bool]],
+                                 pending_idx: List[int], scan: Dict,
+                                 results: List[Optional[List]]) -> None:
+        """Asigna de forma OPTIMA GLOBAL (Algoritmo Hungaro) las unidades sin
+        tarea inmediata a las tareas compartidas de la granja (cosechar,
+        desyerbar, animales, regar, fertilizar, plantar, construir), en vez de
+        la asignacion secuencial anterior (el farmer se queda con lo mas
+        cercano, luego cada mano, en orden fijo) que podia dejar a una unidad
+        cruzando la granja mientras otra estaba al lado de esa tarea."""
         plant_targets = scan["empty"] if self._pick_crop_to_plant() else []
-        priority_groups = [scan["harvest"], scan["weed"], scan["animals"],
-                            scan["water"], scan["fertilize"], plant_targets]
-        for group in priority_groups:
-            target = self._nearest_unassigned(pos, group)
-            if target:
-                self.assigned_targets.add(target)
-                return self._step_towards(pos, target)
-        return None
+        # FIX: "build" es su propia categoria explicita - antes construir un
+        # coop/pasture solo pasaba por casualidad, cuando una unidad llegaba a
+        # una casilla vacia sin tener ya una siembra pendiente ahi mismo. Sin
+        # esto, un animal comprado puede quedar varado en el cobertizo toda
+        # la partida sin nunca producir nada.
+        build_targets = scan["empty"] if self._needs_new_structure(scan) else []
+        groups = {
+            "harvest": scan["harvest"], "build": build_targets, "weed": scan["weed"],
+            "animals": scan["animals"], "water": scan["water"],
+            "fertilize": scan["fertilize"], "plant": plant_targets,
+        }
+        # Dedupe: una misma casilla puede calificar para mas de una categoria
+        # (p.ej. una planta cosechable y sin regar el mismo dia); nos
+        # quedamos con la de mayor prioridad para no ofrecerla dos veces
+        # como si fueran tareas distintas.
+        best_priority: Dict[Tuple[int, int], int] = {}
+        for name, positions in groups.items():
+            rank = self.TASK_PRIORITY[name]
+            for pos in positions:
+                if pos in self.assigned_targets:
+                    continue
+                if pos not in best_priority or rank < best_priority[pos]:
+                    best_priority[pos] = rank
+        tasks = list(best_priority.items())
+        if not tasks:
+            return
+
+        n, m = len(pending_idx), len(tasks)
+        dummy_cols = max(0, n - m)  # columnas "no hacer nada" si faltan tareas
+        cost: List[List[float]] = []
+        for idx in pending_idx:
+            pos = units[idx][0]
+            row = [abs(pos[0] - tpos[0]) + abs(pos[1] - tpos[1]) + rank * self._BIG
+                   for (tpos, rank) in tasks]
+            row.extend([0.0] * dummy_cols)
+            cost.append(row)
+
+        assignment = _hungarian_assignment(cost)
+        for row_i, col_j in enumerate(assignment):
+            idx = pending_idx[row_i]
+            if col_j < m:
+                target_pos = tasks[col_j][0]
+                self.assigned_targets.add(target_pos)
+                results[idx] = self._step_towards(units[idx][0], target_pos)
+            # columna dummy -> results[idx] sigue en None, cae al fallback
 
     def decide_actions(self) -> Tuple[List, List[List]]:
         scan = self._scan_tiles()
         units = [(self.farmer_pos, True)] + [(p, False) for p in self.hands_pos]
-        results: List[List] = []
+        n_units = len(units)
+        invs = [self._inv(i) for i in range(n_units)]
+        results: List[Optional[List]] = [None] * n_units
 
-        for i, (pos, is_farmer) in enumerate(units):
-            inv = self._inv(i)
-            action = self._immediate_action(pos, inv, scan)
+        # 1. Acciones inmediatas: lo que se puede hacer parado en la casilla
+        #    actual (HARVEST/WATER/FEED/CARE/COLLECT_FERTILIZER/PLANT/etc).
+        pending: List[int] = []
+        for i, (pos, _) in enumerate(units):
+            action = self._immediate_action(pos, invs[i], scan)
+            if action is not None:
+                results[i] = action
+            else:
+                pending.append(i)
 
-            if action is None:
-                move = self._assign_movement(pos, scan)
-                if move:
-                    action = move
-                else:
-                    needs_fetch = (self._pick_needed_shed_item(inv, scan) is not None
-                                    and pos not in self.shed_positions)
-                    if needs_fetch:
-                        nearest_shed = self._nearest_unassigned(pos, list(self.shed_positions))
-                        if nearest_shed is None:
-                            nearest_shed = min(
-                                self.shed_positions,
-                                key=lambda c: abs(c[0] - pos[0]) + abs(c[1] - pos[1])
-                            )
-                        action = self._step_towards(pos, nearest_shed)
-                    else:
-                        action = ["PASS"]
+        # 2. Entrega de carga pendiente: es especifica por unidad (depende de
+        #    QUE trae cada una en su inventario), asi que se resuelve antes
+        #    de la asignacion conjunta y con prioridad maxima - es lo que
+        #    evita el loop PICKUP/DROP (ver _cargo_targets).
+        still_pending: List[int] = []
+        for i in pending:
+            pos = units[i][0]
+            cargo_targets = self._cargo_targets(invs[i], scan)
+            target = self._nearest_unassigned(pos, cargo_targets) if cargo_targets else None
+            if target:
+                self.assigned_targets.add(target)
+                results[i] = self._step_towards(pos, target)
+            else:
+                still_pending.append(i)
 
-            results.append(action)
+        # 3. Asignacion optima global (Hungaro) del resto de unidades a las
+        #    tareas compartidas de la granja.
+        if still_pending:
+            self._assign_tasks_optimally(units, still_pending, scan, results)
+
+        # 4. Fallback: buscar en el cobertizo lo que haga falta, o PASS.
+        for i in still_pending:
+            if results[i] is not None:
+                continue
+            pos = units[i][0]
+            inv = invs[i]
+            needs_fetch = (self._pick_needed_shed_item(inv, scan) is not None
+                            and pos not in self.shed_positions)
+            if needs_fetch:
+                nearest_shed = self._nearest_unassigned(pos, list(self.shed_positions))
+                if nearest_shed is None:
+                    nearest_shed = min(
+                        self.shed_positions,
+                        key=lambda c: abs(c[0] - pos[0]) + abs(c[1] - pos[1])
+                    )
+                results[i] = self._step_towards(pos, nearest_shed)
+            else:
+                results[i] = ["PASS"]
 
         farmer_action = results[0] if results else ["PASS"]
         hand_actions = results[1:]
